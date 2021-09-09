@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,6 +75,28 @@ const sampleConfig = `
   ## example collects the system uptime and interface variables.  Reference the
   ## full plugin documentation for configuration details.
 `
+const (
+	SYSTEM_NAME_OID      = ".1.3.6.1.2.1.1.5"
+	IP_ADDRESS_OID       = ".1.3.6.1.2.1.4.20.1.2"
+	SYSTEM_CONTACT_OID   = ".1.3.6.1.2.1.1.4"
+	SYSTEM_LOCATION_OID  = ".1.3.6.1.2.1.1.6"
+	IF_ADMIN_STATUS      = ".1.3.6.1.2.1.2.2.1.7"
+	INTERFACE_STATUS     = ".1.3.6.1.2.1.2.2.1.8"
+	IP_ADDRESS_REGEX     = "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\\.|$)){4}$"
+	VERSION_REGEX        = `(Cisco IOS Software),\s+(.*)\s+Software\s+(.*)`
+	HUAWEI_VERSION_REGEX = `Version ([0-9.]+)[^\r\n]*(V[0-9A-Z]+)`
+	EMPTY_STRING         = ""
+	SYSTEM_DESCRIPTION   = ".1.3.6.1.2.1.1.1"
+)
+const (
+	STATUS_UP   = "UP"
+	STATUS_TEST = "TEST"
+	STATUS_DOWN = "DOWN"
+)
+const (
+	STATUS_UP_NUM   = 1
+	STATUS_TEST_NUM = 3
+)
 
 // execCommand is so tests can mock out exec.Command usage.
 var execCommand = exec.Command
@@ -110,8 +133,10 @@ type Snmp struct {
 
 	snmp.ClientConfig
 
-	Tables []Table `toml:"table"`
-
+	Tables  []Table `toml:"table"`
+	Probe   bool    `toml:"probe"`
+	Period  string  `toml:"interval"`
+	Packets int64   `toml:"packets"`
 	// Name & Fields are the elements of a Table.
 	// Telegraf chokes if we try to embed a Table. So instead we have to embed the
 	// fields of a Table, and construct a Table during runtime.
@@ -126,10 +151,10 @@ func (s *Snmp) init() error {
 	if s.initialized {
 		return nil
 	}
-
 	s.connectionCache = make([]snmpConnection, len(s.Agents))
 
 	for i := range s.Tables {
+
 		if err := s.Tables[i].Init(); err != nil {
 			return fmt.Errorf("initializing table %s: %w", s.Tables[i].Name, err)
 		}
@@ -186,14 +211,14 @@ func (t *Table) Init() error {
 	if err := t.initBuild(); err != nil {
 		return err
 	}
-
 	// initialize all the nested fields
 	for i := range t.Fields {
+
 		if err := t.Fields[i].init(); err != nil {
+
 			return fmt.Errorf("initializing field %s: %w", t.Fields[i].Name, err)
 		}
 	}
-
 	t.initialized = true
 	return nil
 }
@@ -205,8 +230,8 @@ func (t *Table) initBuild() error {
 	if t.Oid == "" {
 		return nil
 	}
-
 	_, _, oidText, fields, err := snmpTable(t.Oid)
+
 	if err != nil {
 		return err
 	}
@@ -216,6 +241,7 @@ func (t *Table) initBuild() error {
 	}
 
 	knownOIDs := map[string]bool{}
+
 	for _, f := range t.Fields {
 		knownOIDs[f.Oid] = true
 	}
@@ -223,8 +249,8 @@ func (t *Table) initBuild() error {
 		if !knownOIDs[f.Oid] {
 			t.Fields = append(t.Fields, f)
 		}
-	}
 
+	}
 	return nil
 }
 
@@ -258,26 +284,29 @@ type Field struct {
 
 // init() converts OID names to numbers, and sets the .Name attribute if unset.
 func (f *Field) init() error {
+
 	if f.initialized {
 		return nil
 	}
 
 	// check if oid needs translation or name is not set
 	if strings.ContainsAny(f.Oid, ":abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") || f.Name == "" {
+
 		_, oidNum, oidText, conversion, err := SnmpTranslate(f.Oid)
 		if err != nil {
 			return fmt.Errorf("translating: %w", err)
 		}
+
 		f.Oid = oidNum
 		if f.Name == "" {
 			f.Name = oidText
 		}
+
 		if f.Conversion == "" {
 			f.Conversion = conversion
 		}
 		//TODO use textual convention conversion from the MIB
 	}
-
 	f.initialized = true
 	return nil
 }
@@ -346,7 +375,6 @@ func (s *Snmp) Gather(acc telegraf.Accumulator) error {
 	if err := s.init(); err != nil {
 		return err
 	}
-
 	var wg sync.WaitGroup
 	for i, agent := range s.Agents {
 		wg.Add(1)
@@ -363,9 +391,39 @@ func (s *Snmp) Gather(acc telegraf.Accumulator) error {
 				Name:   s.Name,
 				Fields: s.Fields,
 			}
+
 			topTags := map[string]string{}
 			if err := s.gatherTable(acc, gs, t, topTags, false); err != nil {
-				acc.AddError(fmt.Errorf("agent %s: %w", agent, err))
+				if s.Probe {
+					rt := RTable{
+						Name: t.Name,
+						Time: time.Now(), //TODO record time at start
+						Rows: make([]RTableRow, 0, 1),
+					}
+					rtr := RTableRow{}
+					rtr.Tags = map[string]string{}
+					rtr.Fields = map[string]interface{}{}
+					if _, ok := rtr.Tags[s.AgentHostTag]; !ok {
+						rtr.Tags[s.AgentHostTag] = gs.Host()
+					}
+					rtr.Fields["@timestamp"] = 0
+					if strings.Contains(s.Period, "m") {
+						period_str := strings.Trim(s.Period, "m")
+						period, err := strconv.Atoi(period_str)
+						if err == nil {
+							rtr.Fields["period"] = period * 60
+						}
+					} else {
+						period_str := strings.Trim(s.Period, "s")
+						rtr.Fields["period"], err = strconv.Atoi(period_str)
+					}
+
+					rt.Rows = append(rt.Rows, rtr)
+
+					acc.AddFields(rt.Name, rtr.Fields, rtr.Tags, rt.Time)
+				} else {
+					acc.AddError(fmt.Errorf("agent %s: %w", agent, err))
+				}
 			}
 
 			// Now is the real tables.
@@ -377,12 +435,14 @@ func (s *Snmp) Gather(acc telegraf.Accumulator) error {
 		}(i, agent)
 	}
 	wg.Wait()
-
 	return nil
 }
 
 func (s *Snmp) gatherTable(acc telegraf.Accumulator, gs snmpConnection, t Table, topTags map[string]string, walk bool) error {
-	rt, err := t.Build(gs, walk)
+
+	var rt *RTable
+	var err error
+	rt, err = t.Build(gs, walk)
 	if err != nil {
 		return err
 	}
@@ -393,26 +453,41 @@ func (s *Snmp) gatherTable(acc telegraf.Accumulator, gs snmpConnection, t Table,
 			for k, v := range tr.Tags {
 				topTags[k] = v
 			}
+
 		} else {
 			// real table. Inherit any specified tags.
 			for _, k := range t.InheritTags {
+
 				if v, ok := topTags[k]; ok {
 					tr.Tags[k] = v
 				}
 			}
 		}
+		if s.Probe {
+			t := time.Now().UTC()
+			tr.Fields["@timestamp"] = t.Format("2006-01-02T15:04:05.000Z")
+			if strings.Contains(s.Period, "m") {
+				period, err := strconv.Atoi(strings.Trim(s.Period, "m"))
+				if err == nil {
+					tr.Fields["period"] = period * 60
+				}
+			} else {
+				tr.Fields["period"], err = strconv.Atoi(strings.Trim(s.Period, "s"))
+			}
+		}
 		if _, ok := tr.Tags[s.AgentHostTag]; !ok {
 			tr.Tags[s.AgentHostTag] = gs.Host()
 		}
+
 		acc.AddFields(rt.Name, tr.Fields, tr.Tags, rt.Time)
 	}
-
 	return nil
 }
 
 // Build retrieves all the fields specified in the table and constructs the RTable.
 func (t Table) Build(gs snmpConnection, walk bool) (*RTable, error) {
 	rows := map[string]RTableRow{}
+	var index_arr []string
 
 	tagCount := 0
 	for _, f := range t.Fields {
@@ -430,7 +505,6 @@ func (t Table) Build(gs snmpConnection, walk bool) (*RTable, error) {
 			// make sure OID has "." because the BulkWalkAll results do, and the prefix needs to match
 			oid = "." + f.Oid
 		}
-
 		// ifv contains a mapping of table OID index to field value
 		ifv := map[string]interface{}{}
 
@@ -468,11 +542,13 @@ func (t Table) Build(gs snmpConnection, walk bool) (*RTable, error) {
 
 				idx := ent.Name[len(oid):]
 				if f.OidIndexSuffix != "" {
+
 					if !strings.HasSuffix(idx, f.OidIndexSuffix) {
 						// this entry doesn't match our OidIndexSuffix. skip it
 						return nil
 					}
-					idx = idx[:len(idx)-len(f.OidIndexSuffix)]
+					//idx = idx[:len(idx)-len(f.OidIndexSuffix)]
+					idx = f.OidIndexSuffix
 				}
 				if f.OidIndexLength != 0 {
 					i := f.OidIndexLength + 1 // leading separator
@@ -486,7 +562,9 @@ func (t Table) Build(gs snmpConnection, walk bool) (*RTable, error) {
 						return r
 					}, idx)
 				}
-
+				//log.Printf("Value of IDX is %s",idx)
+				//index_arr := []string{}
+				index_arr = append(index_arr, idx)
 				// snmptranslate table field value here
 				if f.Translate {
 					if entOid, ok := ent.Value.(string); ok {
@@ -505,7 +583,23 @@ func (t Table) Build(gs snmpConnection, walk bool) (*RTable, error) {
 						err: err,
 					}
 				}
-				ifv[idx] = fv
+
+				if f.Oid == SYSTEM_NAME_OID && idx == ".0" {
+					//log.Printf("Array_index is : %+v length is: %d",index_arr,len(index_arr))
+					addSystemName(index_arr, ifv, fv)
+				} else if f.Oid == IP_ADDRESS_OID {
+					addIPAddr(ifv, fv, idx)
+				} else if f.Oid == SYSTEM_CONTACT_OID || f.Oid == SYSTEM_LOCATION_OID {
+					replaceEmptyString(ifv, fv, idx)
+				} else if f.Name == "software_version" && f.Oid == SYSTEM_DESCRIPTION {
+					extractSoftwareVersion(ifv, fv, t.Name)
+				} else if f.Name == "hardware_version" && t.Name == "cisco_hardware_software_data" && f.Oid == SYSTEM_DESCRIPTION {
+					extractHardwareVersion(ifv, fv)
+				} else if f.Oid == IF_ADMIN_STATUS || f.Oid == INTERFACE_STATUS {
+					statusConversion(ifv, fv, idx)
+				} else {
+					ifv[idx] = fv
+				}
 				return nil
 			})
 			if err != nil {
@@ -517,9 +611,10 @@ func (t Table) Build(gs snmpConnection, walk bool) (*RTable, error) {
 				}
 			}
 		}
-
 		for idx, v := range ifv {
+
 			rtr, ok := rows[idx]
+
 			if !ok {
 				rtr = RTableRow{}
 				rtr.Tags = map[string]string{}
@@ -552,10 +647,80 @@ func (t Table) Build(gs snmpConnection, walk bool) (*RTable, error) {
 		Time: time.Now(), //TODO record time at start
 		Rows: make([]RTableRow, 0, len(rows)),
 	}
+
 	for _, r := range rows {
 		rt.Rows = append(rt.Rows, r)
 	}
 	return &rt, nil
+}
+func addSystemName(index_arr []string, ifv map[string]interface{}, fv interface{}) {
+	for i := 0; i <= len(index_arr)-2; i++ {
+		ifv[index_arr[i]] = fv
+	}
+}
+func addIPAddr(ifv map[string]interface{}, fv interface{}, idx string) {
+	match, _ := regexp.MatchString(IP_ADDRESS_REGEX, idx[1:])
+	if match {
+		ifv[fmt.Sprint(".", strconv.Itoa(fv.(int)))] = idx[1:]
+	}
+}
+
+func extractSoftwareVersion(ifv map[string]interface{}, fv interface{}, tableName string) {
+	if tableName == "cisco_hardware_software_data" {
+		str := fv.(string)
+		//r := regexp.MustCompile(`(Cisco IOS Software),\s+(.*)\s+Software\s+(.*)`)
+		r := regexp.MustCompile(VERSION_REGEX)
+		groups := r.FindAllStringSubmatch(str, -1)
+		if len(groups) == 0 {
+			ifv[".0"] = fmt.Sprint(".")
+		} else {
+			str_1 := groups[0][1]
+			str_2 := groups[0][2]
+			str_3 := groups[0][3]
+			ifv[".0"] = fmt.Sprint(str_1, " ", str_2, " ", str_3)
+		}
+	} else if tableName == "huawei_hardware_software_data" {
+		str := fv.(string)
+		//r := regexp.MustCompile(`Version ([0-9.]+)[^\r\n]*(V[0-9A-Z]+)`)
+		r := regexp.MustCompile(HUAWEI_VERSION_REGEX)
+		groups := r.FindAllStringSubmatch(str, -1)
+		if len(groups) == 0 {
+			ifv[".0"] = fmt.Sprint(".")
+		} else {
+			str_1 := groups[0][0]
+			ifv[".0"] = fmt.Sprint(str_1)
+		}
+	}
+
+}
+
+func extractHardwareVersion(ifv map[string]interface{}, fv interface{}) {
+	str := fv.(string)
+	//r := regexp.MustCompile(`(Cisco IOS Software),\s+(.*)\s+Software\s+(.*)`)
+	r := regexp.MustCompile(VERSION_REGEX)
+	groups := r.FindAllStringSubmatch(str, -1)
+	if len(groups) == 0 {
+		ifv[".0"] = fmt.Sprint(".")
+	} else {
+		str_2 := groups[0][2]
+		ifv[".0"] = fmt.Sprint(str_2)
+	}
+}
+func statusConversion(ifv map[string]interface{}, fv interface{}, idx string) {
+	if fv == STATUS_UP_NUM {
+		ifv[idx] = STATUS_UP
+	} else if fv == STATUS_TEST_NUM {
+		ifv[idx] = STATUS_TEST
+	} else {
+		ifv[idx] = STATUS_DOWN
+	}
+}
+func replaceEmptyString(ifv map[string]interface{}, fv interface{}, idx string) {
+	if fv == EMPTY_STRING {
+		ifv[idx] = "-"
+	} else {
+		ifv[idx] = fv
+	}
 }
 
 // snmpConnection is an interface which wraps a *gosnmp.GoSNMP object.
@@ -575,9 +740,7 @@ func (s *Snmp) getConnection(idx int) (snmpConnection, error) {
 	if gs := s.connectionCache[idx]; gs != nil {
 		return gs, nil
 	}
-
 	agent := s.Agents[idx]
-
 	var err error
 	var gs snmp.GosnmpWrapper
 	gs, err = snmp.NewWrapper(s.ClientConfig)
