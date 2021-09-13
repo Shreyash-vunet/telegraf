@@ -133,10 +133,10 @@ type Snmp struct {
 
 	snmp.ClientConfig
 
-	Tables  []Table `toml:"table"`
-	Probe   bool    `toml:"probe"`
-	Period  string  `toml:"interval"`
-	Packets int64   `toml:"packets"`
+	Tables            []Table `toml:"table"`
+	Include_time_info bool    `toml:"include_time_info"`
+	Period            string  `toml:"interval"`
+	Packets           int64   `toml:"packets"`
 	// Name & Fields are the elements of a Table.
 	// Telegraf chokes if we try to embed a Table. So instead we have to embed the
 	// fields of a Table, and construct a Table during runtime.
@@ -394,7 +394,7 @@ func (s *Snmp) Gather(acc telegraf.Accumulator) error {
 
 			topTags := map[string]string{}
 			if err := s.gatherTable(acc, gs, t, topTags, false); err != nil {
-				if s.Probe {
+				if s.Include_time_info {
 					rt := RTable{
 						Name: t.Name,
 						Time: time.Now(), //TODO record time at start
@@ -440,9 +440,7 @@ func (s *Snmp) Gather(acc telegraf.Accumulator) error {
 
 func (s *Snmp) gatherTable(acc telegraf.Accumulator, gs snmpConnection, t Table, topTags map[string]string, walk bool) error {
 
-	var rt *RTable
-	var err error
-	rt, err = t.Build(gs, walk)
+	rt, err := t.Build(gs, walk)
 	if err != nil {
 		return err
 	}
@@ -463,7 +461,7 @@ func (s *Snmp) gatherTable(acc telegraf.Accumulator, gs snmpConnection, t Table,
 				}
 			}
 		}
-		if s.Probe {
+		if s.Include_time_info {
 			t := time.Now().UTC()
 			tr.Fields["@timestamp"] = t.Format("2006-01-02T15:04:05.000Z")
 			if strings.Contains(s.Period, "m") {
