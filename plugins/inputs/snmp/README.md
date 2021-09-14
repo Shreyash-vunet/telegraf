@@ -49,6 +49,9 @@ information.
   ## The GETBULK max-repetitions parameter.
   # max_repetitions = 10
 
+  ##Include period & timestamp in each document
+  #include_time_info = true
+  
   ## SNMPv3 authentication and encryption options.
   ##
   ## Security Name.

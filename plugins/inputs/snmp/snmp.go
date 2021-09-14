@@ -151,6 +151,7 @@ func (s *Snmp) init() error {
 	if s.initialized {
 		return nil
 	}
+
 	s.connectionCache = make([]snmpConnection, len(s.Agents))
 
 	for i := range s.Tables {
@@ -211,6 +212,7 @@ func (t *Table) Init() error {
 	if err := t.initBuild(); err != nil {
 		return err
 	}
+
 	// initialize all the nested fields
 	for i := range t.Fields {
 
@@ -375,6 +377,7 @@ func (s *Snmp) Gather(acc telegraf.Accumulator) error {
 	if err := s.init(); err != nil {
 		return err
 	}
+
 	var wg sync.WaitGroup
 	for i, agent := range s.Agents {
 		wg.Add(1)
